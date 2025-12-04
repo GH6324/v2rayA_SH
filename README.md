@@ -33,10 +33,16 @@
 
 ### 快速运行
 
-直接运行一键脚本即可：
+Gh-proxy 网络代理安装脚本：
 
 ```bash
 bash <(curl -Ls https://gh-proxy.com/raw.githubusercontent.com/GH6324/v2rayA_SH/main/install.sh)
+```
+
+无网络代理安装脚本（直连Github）
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/GH6324/v2rayA_SH/main/install.sh)
 ```
 
 -----
