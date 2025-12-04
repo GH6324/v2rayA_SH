@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # =========================================================
-# Xray-core + v2rayA 管理脚本
+# Xray-core + v2rayA 管理脚本 
 # =========================================================
 
 # -------------------------------------------------------------
 # 全局配置
 # -------------------------------------------------------------
-GH_PROXY="https://gh-proxy.com/"
+# 更换为更稳定的镜像源，防止双重重定向
+GH_PROXY=""
 
-# 兜底版本
+# 兜底版本 (仅当无法连接 GitHub 且 API 均失败时使用)
 FALLBACK_XRAY_VER="v25.1.1" 
 FALLBACK_V2RAYA_VER="v2.2.6"
 
@@ -75,29 +76,27 @@ install_deps() {
 }
 
 # -------------------------------------------------------------
-# 辅助逻辑：端口获取与验证
+# 辅助逻辑：版本对比与端口
 # -------------------------------------------------------------
+
+# 版本对比函数：如果 $1 >= $2 返回 0 (true)，否则返回 1 (false)
+version_ge() {
+    # 移除 'v' 前缀进行比较
+    test "$(echo -e "${1#v}\n${2#v}" | sort -rV | head -n 1)" == "${1#v}"
+}
+
 get_current_port() {
-    # 尝试从 systemd 文件中读取端口
+    CURRENT_PORT=""
     if [[ -f /etc/systemd/system/v2raya.service ]]; then
         CURRENT_PORT=$(grep "V2RAYA_ADDRESS" /etc/systemd/system/v2raya.service | awk -F: '{print $2}' | tr -d '"')
     elif [[ -f /etc/init.d/v2raya ]]; then
         CURRENT_PORT=$(grep "V2RAYA_ADDRESS" /etc/init.d/v2raya | awk -F: '{print $2}' | tr -d '"')
     fi
-    
-    # 如果没找到，默认是 2017
-    if [[ -z "$CURRENT_PORT" ]]; then
-        CURRENT_PORT="2017 (默认)"
-    fi
+    if [[ -z "$CURRENT_PORT" ]]; then CURRENT_PORT="2017 (默认)"; fi
 }
 
 validate_port() {
-    local port=$1
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        return 1
-    else
-        return 0
-    fi
+    if [[ ! "$1" =~ ^[0-9]+$ ]] || [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then return 1; else return 0; fi
 }
 
 # -------------------------------------------------------------
@@ -108,27 +107,40 @@ get_latest_release_silent() {
     local fallback=$2
     local ver=""
     local api_url="https://api.github.com/repos/$repo/releases/latest"
-    local json=$(curl -s --max-time 2 "$api_url")
+    
+    # 1. API 探测 (超时时间增加到 3s)
+    local json=$(curl -s --max-time 3 "$api_url")
     ver=$(echo "$json" | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4)
+
+    # 2. 302 重定向探测 (更可靠)
     if [[ -z "$ver" ]]; then
-        local redirect_url=$(curl -sL -I -o /dev/null -w %{url_effective} --max-time 3 "https://github.com/$repo/releases/latest")
+        local redirect_url=$(curl -sL -I -o /dev/null -w %{url_effective} --max-time 5 "https://github.com/$repo/releases/latest")
         ver=$(basename "$redirect_url")
         if [[ "$ver" == "latest" ]] || [[ "$ver" == "releases" ]]; then ver=""; fi
     fi
+    
+    # 3. 兜底
     if [[ -z "$ver" ]]; then echo "$fallback"; else echo "$ver"; fi
 }
 
 get_local_version() {
+    # Xray
     if [[ -f "$XRAY_BIN_PATH" ]]; then
         LOCAL_XRAY_VER=$($XRAY_BIN_PATH version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-        if [[ -z "$LOCAL_XRAY_VER" ]]; then LOCAL_XRAY_VER="未知"; fi
+        [ -z "$LOCAL_XRAY_VER" ] && LOCAL_XRAY_VER="未知"
     else
         LOCAL_XRAY_VER="未安装"
     fi
 
+    # v2rayA (修复正则)
     if [[ -f "$V2RAYA_BIN_PATH" ]]; then
+        # 尝试更宽泛的匹配，有些版本输出格式包含 v，有些不包含
         LOCAL_V2RAYA_VER=$($V2RAYA_BIN_PATH --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
-        if [[ -z "$LOCAL_V2RAYA_VER" ]]; then LOCAL_V2RAYA_VER="未知"; fi
+        # 如果还是抓不到，尝试 awk 抓取最后一段
+        if [[ -z "$LOCAL_V2RAYA_VER" ]]; then
+            LOCAL_V2RAYA_VER=$($V2RAYA_BIN_PATH --version 2>&1 | head -n 1 | awk '{print $NF}')
+        fi
+        [ -z "$LOCAL_V2RAYA_VER" ] && LOCAL_V2RAYA_VER="未知"
     else
         LOCAL_V2RAYA_VER="未安装"
     fi
@@ -141,18 +153,23 @@ install_xray() {
     local target_ver=$1
     echo -e "${YELLOW}>>> 开始部署 Xray-Core ($target_ver) ...${PLAIN}"
     
+    # 停止服务
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl stop v2raya xray >/dev/null 2>&1; fi
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then rc-service v2raya stop >/dev/null 2>&1; fi
 
     local dl_url="${GH_PROXY}https://github.com/XTLS/Xray-core/releases/download/${target_ver}/Xray-linux-${XRAY_ARCH}.zip"
     echo -e "正在下载: $dl_url"
+    
+    # 清理旧文件
+    rm -f /tmp/xray.zip
     wget -q --show-progress -O /tmp/xray.zip "$dl_url"
 
-    if [[ $? -ne 0 ]] || [[ ! -s /tmp/xray.zip ]]; then
+    # 验证文件大小 (防止下载到空文件或HTML)
+    if [[ $? -ne 0 ]] || [[ ! -s /tmp/xray.zip ]] || [[ $(stat -c%s /tmp/xray.zip) -lt 10000 ]]; then
         echo -e "${RED}下载失败，尝试兜底版本...${PLAIN}"
         dl_url="${GH_PROXY}https://github.com/XTLS/Xray-core/releases/download/${FALLBACK_XRAY_VER}/Xray-linux-${XRAY_ARCH}.zip"
         wget -q --show-progress -O /tmp/xray.zip "$dl_url"
-        if [[ $? -ne 0 ]]; then echo -e "${RED}错误: Xray 下载失败${PLAIN}"; return 1; fi
+        if [[ $? -ne 0 ]]; then echo -e "${RED}错误: Xray 下载严重失败，请检查网络。${PLAIN}"; return 1; fi
     fi
 
     mkdir -p /tmp/xray_install
@@ -173,15 +190,23 @@ install_v2raya() {
     local v_num=${target_ver#v}
     local dl_url="${GH_PROXY}https://github.com/v2rayA/v2rayA/releases/download/${target_ver}/v2raya_linux_${V2RAYA_ARCH}_${target_ver}"
     echo -e "正在下载: $dl_url"
+    
+    rm -f "$V2RAYA_BIN_PATH"
     wget -q --show-progress -O "$V2RAYA_BIN_PATH" "$dl_url"
 
-    if [[ $? -ne 0 ]] || [[ ! -s "$V2RAYA_BIN_PATH" ]]; then
+    # 验证文件
+    if [[ $? -ne 0 ]] || [[ ! -s "$V2RAYA_BIN_PATH" ]] || [[ $(stat -c%s "$V2RAYA_BIN_PATH") -lt 1000000 ]]; then
+        echo -e "${YELLOW}尝试备用命名规则...${PLAIN}"
         dl_url="${GH_PROXY}https://github.com/v2rayA/v2rayA/releases/download/${target_ver}/v2raya_linux_${V2RAYA_ARCH}_${v_num}"
         wget -q --show-progress -O "$V2RAYA_BIN_PATH" "$dl_url"
-        if [[ $? -ne 0 ]]; then
-             dl_url="${GH_PROXY}https://github.com/v2rayA/v2rayA/releases/download/${FALLBACK_V2RAYA_VER}/v2raya_linux_${V2RAYA_ARCH}_${FALLBACK_V2RAYA_VER#v}"
+        
+        # 如果还是失败，使用兜底
+        if [[ $? -ne 0 ]] || [[ $(stat -c%s "$V2RAYA_BIN_PATH") -lt 1000000 ]]; then
+             echo -e "${RED}下载失败，尝试回退到稳定兜底版本...${PLAIN}"
+             local fb_num=${FALLBACK_V2RAYA_VER#v}
+             dl_url="${GH_PROXY}https://github.com/v2rayA/v2rayA/releases/download/${FALLBACK_V2RAYA_VER}/v2raya_linux_${V2RAYA_ARCH}_${fb_num}"
              wget -q --show-progress -O "$V2RAYA_BIN_PATH" "$dl_url"
-             if [[ $? -ne 0 ]]; then echo -e "${RED}错误: v2rayA 下载失败${PLAIN}"; return 1; fi
+             if [[ $? -ne 0 ]]; then echo -e "${RED}错误: v2rayA 下载严重失败。${PLAIN}"; return 1; fi
         fi
     fi
     chmod +x "$V2RAYA_BIN_PATH"
@@ -242,7 +267,6 @@ EOF
     fi
     
     # 自动放行端口
-    echo -e "${YELLOW}正在尝试放行端口 $custom_port ...${PLAIN}"
     if command -v ufw >/dev/null 2>&1; then ufw allow $custom_port/tcp >/dev/null; fi
     if command -v firewall-cmd >/dev/null 2>&1; then 
         firewall-cmd --permanent --add-port=$custom_port/tcp >/dev/null 2>&1
@@ -260,15 +284,11 @@ restart_service() {
     echo -e "${GREEN}服务已重启。${PLAIN}"
 }
 
-# -------------------------------------------------------------
-# 卸载功能
-# -------------------------------------------------------------
 uninstall_app() {
     echo -e "${RED}⚠️  警告: 此操作将删除 Xray-core 和 v2rayA 以及相关配置文件。${PLAIN}"
     read -p "确定要继续吗? [y/N]: " confirm
     if [[ "$confirm" != "y" ]]; then echo "操作已取消"; return; fi
-
-    echo -e "${YELLOW}正在停止并移除服务...${PLAIN}"
+    echo -e "${YELLOW}正在停止服务...${PLAIN}"
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
         systemctl stop v2raya >/dev/null 2>&1
         systemctl disable v2raya >/dev/null 2>&1
@@ -279,20 +299,11 @@ uninstall_app() {
         rc-update del v2raya >/dev/null 2>&1
         rm -f /etc/init.d/v2raya
     fi
-    
-    # 杀进程
     pkill -9 v2raya >/dev/null 2>&1
     pkill -9 xray >/dev/null 2>&1
-
-    echo -e "${YELLOW}正在删除文件...${PLAIN}"
-    rm -rf "$XRAY_BIN_PATH"
-    rm -rf "$XRAY_ASSET_PATH"
-    rm -rf "$V2RAYA_BIN_PATH"
-    rm -rf "$V2RAYA_CONF_PATH"
-    rm -f /var/log/v2raya.log /var/log/v2raya.error.log
-
-    echo -e "${GREEN}卸载完成！系统已清理干净。${PLAIN}"
-    echo -e "注意: 防火墙端口可能需要您手动关闭。"
+    rm -rf "$XRAY_BIN_PATH" "$XRAY_ASSET_PATH" "$V2RAYA_BIN_PATH" "$V2RAYA_CONF_PATH"
+    rm -f /var/log/v2raya.log
+    echo -e "${GREEN}卸载完成！${PLAIN}"
     exit 0
 }
 
@@ -318,20 +329,20 @@ show_status_and_menu() {
     printf "${BOLD}%-10s %-16s %-16s %-10s${PLAIN}\n" "组件" "本地版本" "最新版本" "状态"
     echo -e "----------------------------------------------------"
 
-    # Xray 状态
+    # Xray 状态逻辑优化: 本地 >= 远程 则显示最新
     if [[ "$LOCAL_XRAY_VER" == "未安装" ]]; then
         X_STATUS="${RED}[未安装]${PLAIN}"
-    elif [[ "$REMOTE_XRAY" == *"$LOCAL_XRAY_VER"* ]]; then
+    elif version_ge "$LOCAL_XRAY_VER" "$REMOTE_XRAY"; then
         X_STATUS="${GREEN}[最新]${PLAIN}"
     else
         X_STATUS="${YELLOW}[可更新]${PLAIN}"
     fi
     printf "%-10s %-16s %-16s %-10b\n" "Xray" "$LOCAL_XRAY_VER" "$REMOTE_XRAY" "$X_STATUS"
 
-    # v2rayA 状态
-    if [[ "$LOCAL_V2RAYA_VER" == "未安装" ]]; then
-        V_STATUS="${RED}[未安装]${PLAIN}"
-    elif [[ "$REMOTE_V2RAYA" == *"$LOCAL_V2RAYA_VER"* ]]; then
+    # v2rayA 状态逻辑优化
+    if [[ "$LOCAL_V2RAYA_VER" == "未安装" || "$LOCAL_V2RAYA_VER" == "未知" ]]; then
+        V_STATUS="${RED}[$LOCAL_V2RAYA_VER]${PLAIN}"
+    elif version_ge "$LOCAL_V2RAYA_VER" "$REMOTE_V2RAYA"; then
         V_STATUS="${GREEN}[最新]${PLAIN}"
     else
         V_STATUS="${YELLOW}[可更新]${PLAIN}"
@@ -353,16 +364,12 @@ show_status_and_menu() {
         1) 
             read -p "请输入 v2rayA 监听端口 [默认2017]: " input_port
             if [[ -z "$input_port" ]]; then input_port="2017"; fi
-            if ! validate_port "$input_port"; then echo -e "${RED}无效端口，请输入 1-65535${PLAIN}"; exit 1; fi
-            
+            if ! validate_port "$input_port"; then echo -e "${RED}无效端口${PLAIN}"; exit 1; fi
             install_xray "$REMOTE_XRAY"
             install_v2raya "$REMOTE_V2RAYA"
             config_system "$input_port"
             restart_service
-            
-            # 获取IP提示
-            PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org)
-            [ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(hostname -I | awk '{print $1}')
+            PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || hostname -I | awk '{print $1}')
             echo -e "\n${GREEN}安装完成!${PLAIN} 面板地址: http://${PUBLIC_IP}:${input_port}"
             ;;
         2) 
@@ -393,9 +400,6 @@ show_status_and_menu() {
     esac
 }
 
-# -------------------------------------------------------------
-# 主程序入口
-# -------------------------------------------------------------
 check_root
 check_arch
 check_init
