@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Xray-core + v2rayA 管理脚本 (Bug修复版)
+# Xray-core + v2rayA 管理脚本
 # =========================================================
 
 # -------------------------------------------------------------
@@ -342,7 +342,7 @@ install_deps
 
 clear
 echo -e "${SKYBLUE}==============================================${PLAIN}"
-echo -e "${SKYBLUE}     Xray-core + v2rayA 管理脚本 (BugFixed)   ${PLAIN}"
+echo -e "${SKYBLUE}     Xray-core + v2rayA 管理脚本   ${PLAIN}"
 echo -e "${SKYBLUE}==============================================${PLAIN}"
 get_local_version
 echo -e " 系统架构: ${YELLOW}$ARCH ($INIT_SYSTEM)${PLAIN}"
